@@ -1,0 +1,11 @@
+# Build output
+build/
+build-*/
+
+# macOS
+.DS_Store
+
+# Editor / IDE folders
+.vscode/
+.idea/
+.cache/.cache/
