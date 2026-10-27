@@ -8,6 +8,24 @@ enum Chirality: String, Sendable {
 
 enum Finger: String, CaseIterable, Sendable {
     case thumb, index, middle, ring, little
+
+    /// The finger's four joints from its base out to the tip. Each bone runs from one joint to the next.
+    var chain: [Joint] {
+        switch self {
+        case .thumb: [.thumbCMC, .thumbMP, .thumbIP, .thumbTip]
+        case .index: [.indexMCP, .indexPIP, .indexDIP, .indexTip]
+        case .middle: [.middleMCP, .middlePIP, .middleDIP, .middleTip]
+        case .ring: [.ringMCP, .ringPIP, .ringDIP, .ringTip]
+        case .little: [.littleMCP, .littlePIP, .littleDIP, .littleTip]
+        }
+    }
+
+    static let fourFingers: [Finger] = [.index, .middle, .ring, .little]
+}
+
+/// How bent one finger is.
+enum FingerState: String, Sendable {
+    case extended, bent, curled
 }
 
 /// The 21 hand joints Vision reports, kept Vision-free so later layers
@@ -24,6 +42,10 @@ enum Joint: String, CaseIterable, Sendable {
 }
 
 /// Everything we know about one hand in one camera frame.
+///
+/// Nothing here uses the wrist: it's often out of frame or guessed when you hold a hand up to a
+/// laptop camera. Each finger is measured from its own joints, and sizes are measured against the
+/// knuckle span (index knuckle to little-finger knuckle), which doesn't change as fingers move.
 struct HandSnapshot: Sendable {
     let chirality: Chirality
     let confidence: Float
@@ -33,45 +55,64 @@ struct HandSnapshot: Sendable {
     let jointConfidence: [Joint: Float]
     /// Frame width / height. Multiply x differences by this so distances aren't squashed.
     let aspectRatio: Double
-    let extendedFingers: Set<Finger>
-    /// Length of the line from thumb tip to index tip, in index-bone lengths (indexMCP→indexPIP).
-    /// nil unless thumb and index are clearly seen, the thumb is out, and the other three fingers are curled.
+    /// For each finger whose four joints were all seen: the straight line from its base to its tip,
+    /// divided by its three bones laid end to end. 1 is perfectly straight; curling folds the tip back
+    /// and the number drops. Pointing at the camera shrinks the line and the bones alike, so it stays put.
+    let straightness: [Finger: Double]
+    /// Index, middle, ring and little from their straightness; the thumb from whether it sticks out
+    /// from the palm. Fingers that weren't seen well enough are missing.
+    let fingerStates: [Finger: FingerState]
+    /// Index knuckle to little-finger knuckle, in aspect-corrected units. The ruler for every other size.
+    let knuckleSpan: Double?
+    /// Thumb tip to index tip, in knuckle spans. nil unless both tips are clearly seen.
     let pinchDistance: Double?
-    /// Middle of all detected finger joints (wrist excluded).
+    /// Thumb and index working together (thumb out or touching the index, index not curled into the
+    /// palm) while middle, ring and little are curled. The shape you hold a pinch-to-zoom in.
+    let isPinchPose: Bool
+    /// Middle of all detected finger joints.
     let palmCenter: CGPoint?
     /// Apparent index finger length (MCP→tip) in aspect-corrected units. Shrinks as the tip swings toward the camera.
     let indexLength: Double?
-    /// No fingers out and every visible fingertip pulled in close to the palm point.
+    /// Index, middle, ring and little all curled. (In a pinch the index is only bent, not curled.)
     let isFist: Bool
-    /// Average distance of the five fingertips from their middle, in index-bone lengths; nil unless all five are seen.
+    /// Average distance of the five fingertips from their middle, in knuckle spans; nil unless all five are seen.
     /// Small when the fingertips are bunched together, large with the hand spread open.
     let tipSpread: Double?
     /// Palm velocity in normalized image units per second (+x right, +y up). Filled in by HandTracker.
     var velocity: CGVector = .zero
 
+    var extendedFingers: Set<Finger> {
+        Set(fingerStates.filter { $0.value == .extended }.keys)
+    }
     var fingerCount: Int { extendedFingers.count }
-    var isPinching: Bool { (pinchDistance ?? .infinity) < Self.pinchThreshold }
-    /// All five fingertips bunched together like a bird's beak (and not curled into a fist).
-    var isBeak: Bool { !isFist && (tipSpread ?? .infinity) < Self.beakSpread }
 
-    // Tunables — expect to adjust these once you see real numbers in the log.
-    /// Pinch closes below this many index-bone lengths...
-    static let pinchThreshold = 0.5
+    var isPinching: Bool {
+        guard let pinchDistance else { return false }
+        return pinchDistance < Self.pinchThreshold
+    }
+
+    /// All five fingertips bunched together like a bird's beak (and not curled into a fist).
+    var isBeak: Bool {
+        guard let tipSpread, !isFist else { return false }
+        return tipSpread < Self.beakSpread
+    }
+
+    // Tunables — run with --stream to see each finger's straightness and adjust these.
+    /// A finger at least this straight is extended...
+    static let extendedStraightness = 0.85
+    /// ...and one at most this straight is curled. In between it's bent (a pinching index sits there).
+    static let curledStraightness = 0.55
+    /// The thumb is out when its tip is at least this many knuckle spans from the index knuckle.
+    static let thumbOutDistance = 0.6
+    /// Pinch closes below this many knuckle spans...
+    static let pinchThreshold = 0.3
     /// ...and opens again above this (hysteresis so it doesn't flicker).
-    static let pinchReleaseThreshold = 0.7
-    /// Thumb and index joints need at least this confidence to count toward a pinch.
+    static let pinchReleaseThreshold = 0.4
+    /// Thumb and index tips need at least this confidence to count toward a pinch.
     /// Vision invents a low-confidence thumb next to a lone pointing finger.
     static let pinchJointConfidence: Float = 0.6
-    /// A finger counts as extended when its tip is this much farther from the wrist than its PIP joint.
-    static let fingerExtensionRatio = 1.15
-    /// The thumb counts as extended when its tip is at least this far (in palm sizes) from the index knuckle.
-    static let thumbExtensionDistance = 0.5
-    /// In a fist every visible fingertip is within this many index-bone lengths of the palm point.
-    static let fistTipRadius = 1.6
-    /// A fist needs at least this many joints seen, so a hand half out of frame doesn't count.
-    static let fistMinJoints = 10
-    /// Fingertips count as a beak when their average distance from their middle is under this many index-bone lengths.
-    static let beakSpread = 0.6
+    /// Fingertips count as a beak when their average distance from their middle is under this many knuckle spans.
+    static let beakSpread = 0.35
 
     init(chirality: Chirality, confidence: Float, joints: [Joint: CGPoint],
          jointConfidence: [Joint: Float], aspectRatio: Double) {
@@ -84,81 +125,108 @@ struct HandSnapshot: Sendable {
         // Normalized coords are squashed horizontally; scale x by the aspect ratio so distances are true.
         func distance(_ a: Joint, _ b: Joint) -> Double? {
             guard let p = joints[a], let q = joints[b] else { return nil }
-            return hypot((p.x - q.x) * aspectRatio, p.y - q.y)
+            return Self.distance(p, q, aspectRatio: aspectRatio)
         }
         func confident(_ joint: Joint) -> Bool {
-            (jointConfidence[joint] ?? 0) >= Self.pinchJointConfidence
+            guard let confidence = jointConfidence[joint] else { return false }
+            return confidence >= Self.pinchJointConfidence
         }
 
-        let palmSize = distance(.wrist, .middleMCP)
-        // The index finger's first bone is the same length however the hand is posed, so it's our ruler.
-        // If it's hidden (e.g. curled in a fist), half the palm is about the same length.
-        let bone = distance(.indexMCP, .indexPIP) ?? palmSize.map { $0 / 2 }
+        let span = distance(.indexMCP, .littleMCP)
+        let ruler: Double?
+        if let span, span > 0 {
+            ruler = span
+        } else {
+            ruler = nil
+        }
+        knuckleSpan = ruler
 
-        var extended = Set<Finger>()
-        let fingerJoints: [(Finger, tip: Joint, pip: Joint)] = [
-            (.index, .indexTip, .indexPIP),
-            (.middle, .middleTip, .middlePIP),
-            (.ring, .ringTip, .ringPIP),
-            (.little, .littleTip, .littlePIP),
-        ]
-        for (finger, tip, pip) in fingerJoints {
-            if let tipDist = distance(tip, .wrist), let pipDist = distance(pip, .wrist),
-               tipDist > pipDist * Self.fingerExtensionRatio {
-                extended.insert(finger)
+        // Each finger on its own: how straight is the chain of its three bones?
+        var straightness: [Finger: Double] = [:]
+        for finger in Finger.allCases {
+            let chain = finger.chain
+            guard let base = distance(chain[0], chain[3]),
+                  let firstBone = distance(chain[0], chain[1]),
+                  let secondBone = distance(chain[1], chain[2]),
+                  let thirdBone = distance(chain[2], chain[3]) else { continue }
+            let boneLength = firstBone + secondBone + thirdBone
+            guard boneLength > 0 else { continue }
+            straightness[finger] = base / boneLength
+        }
+        self.straightness = straightness
+
+        var states: [Finger: FingerState] = [:]
+        for finger in Finger.fourFingers {
+            guard let value = straightness[finger] else { continue }
+            if value >= Self.extendedStraightness {
+                states[finger] = .extended
+            } else if value <= Self.curledStraightness {
+                states[finger] = .curled
+            } else {
+                states[finger] = .bent
             }
         }
-        // Thumb doesn't curl toward the wrist, so check that it sticks out away from the palm instead.
-        if let palmSize, palmSize > 0,
-           let tipToIndex = distance(.thumbTip, .indexMCP),
-           let tipToLittle = distance(.thumbTip, .littleMCP),
-           let ipToLittle = distance(.thumbIP, .littleMCP),
-           tipToLittle > ipToLittle,
-           tipToIndex / palmSize > Self.thumbExtensionDistance {
-            extended.insert(.thumb)
-        }
-        self.extendedFingers = extended
 
-        // Pinch is just the thumb-tip → index-tip line. Only trust it when both digits are really there.
-        let othersCurled = extended.isDisjoint(with: [.middle, .ring, .little])
-        if othersCurled, extended.contains(.thumb),
-           [Joint.thumbTip, .thumbIP, .indexTip, .indexPIP].allSatisfy(confident),
-           let ruler = distance(.indexMCP, .indexPIP), ruler > 0,
-           let line = distance(.thumbTip, .indexTip) {
-            pinchDistance = line / ruler
+        // The thumb barely curls; what matters is whether it sticks out from the palm or lies across it.
+        let thumbOut: Bool
+        if let ruler,
+           let tipToIndexKnuckle = distance(.thumbTip, .indexMCP),
+           let tipToLittleKnuckle = distance(.thumbTip, .littleMCP),
+           let ipToLittleKnuckle = distance(.thumbIP, .littleMCP) {
+            let pointsAwayFromPalm = tipToLittleKnuckle > ipToLittleKnuckle
+            let farFromIndexKnuckle = tipToIndexKnuckle / ruler > Self.thumbOutDistance
+            thumbOut = pointsAwayFromPalm && farFromIndexKnuckle
+            states[.thumb] = thumbOut ? .extended : .curled
         } else {
-            pinchDistance = nil
+            thumbOut = false
         }
+        fingerStates = states
+
+        // Pinch is just the thumb-tip → index-tip line. Only trust it when both tips are really there.
+        let pinch: Double?
+        if let ruler, confident(.thumbTip), confident(.indexTip), let line = distance(.thumbTip, .indexTip) {
+            pinch = line / ruler
+        } else {
+            pinch = nil
+        }
+        pinchDistance = pinch
+
+        // Middle, ring and little have to be seen curled. Not seeing them proves nothing.
+        let othersCurled = [Finger.middle, .ring, .little].allSatisfy { states[$0] == .curled }
+        let indexFree = states[.index] == .extended || states[.index] == .bent
+        let thumbTouchingIndex: Bool
+        if let pinch {
+            thumbTouchingIndex = pinch < Self.pinchReleaseThreshold
+        } else {
+            thumbTouchingIndex = false
+        }
+        isPinchPose = pinch != nil && othersCurled && indexFree && (thumbOut || thumbTouchingIndex)
+
+        isFist = Finger.fourFingers.allSatisfy { states[$0] == .curled }
 
         let fingerPoints = joints.filter { $0.key != .wrist }.map(\.value)
-        let center: CGPoint?
-        if fingerPoints.isEmpty {
-            center = nil
-        } else {
-            let n = CGFloat(fingerPoints.count)
-            center = CGPoint(x: fingerPoints.map(\.x).reduce(0, +) / n,
-                             y: fingerPoints.map(\.y).reduce(0, +) / n)
-        }
-        palmCenter = center
+        palmCenter = Self.middle(of: fingerPoints)
 
         indexLength = distance(.indexMCP, .indexTip)
 
-        if extended.isEmpty, joints.count >= Self.fistMinJoints, let center, let bone, bone > 0 {
-            isFist = Joint.tips.compactMap { joints[$0] }.allSatisfy {
-                hypot(($0.x - center.x) * aspectRatio, $0.y - center.y) / bone < Self.fistTipRadius
-            }
-        } else {
-            isFist = false
-        }
-
         let tips = Joint.tips.compactMap { joints[$0] }
-        if tips.count == Joint.tips.count, let bone, bone > 0 {
-            let n = CGFloat(tips.count)
-            let middle = CGPoint(x: tips.map(\.x).reduce(0, +) / n, y: tips.map(\.y).reduce(0, +) / n)
-            let total = tips.map { hypot(($0.x - middle.x) * aspectRatio, $0.y - middle.y) }.reduce(0, +)
-            tipSpread = total / Double(n) / bone
+        if tips.count == Joint.tips.count, let ruler, let middle = Self.middle(of: tips) {
+            let total = tips.map { Self.distance($0, middle, aspectRatio: aspectRatio) }.reduce(0, +)
+            tipSpread = total / Double(tips.count) / ruler
         } else {
             tipSpread = nil
         }
+    }
+
+    private static func distance(_ p: CGPoint, _ q: CGPoint, aspectRatio: Double) -> Double {
+        hypot((p.x - q.x) * aspectRatio, p.y - q.y)
+    }
+
+    private static func middle(of points: [CGPoint]) -> CGPoint? {
+        guard !points.isEmpty else { return nil }
+        let count = CGFloat(points.count)
+        let x = points.map(\.x).reduce(0, +) / count
+        let y = points.map(\.y).reduce(0, +) / count
+        return CGPoint(x: x, y: y)
     }
 }

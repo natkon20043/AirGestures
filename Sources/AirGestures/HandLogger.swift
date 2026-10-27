@@ -107,15 +107,41 @@ final class HandLogger: @unchecked Sendable {
         if let extra { print("    \(extra)") }
     }
 
+    /// Fingers read T I M R L: capital = extended, lower case = bent, · = curled, ? = not seen.
     private func summary(_ hand: HandSnapshot) -> String {
-        let fingers = Finger.allCases.map { hand.extendedFingers.contains($0) ? String($0.rawValue.prefix(1)).uppercased() : "·" }.joined()
-        let fist = hand.isFist ? "fist" : hand.isBeak ? "beak" : "    "
+        let fingers = Finger.allCases.map { Self.letter(for: $0, in: hand) }.joined()
+        let shape: String
+        if hand.isFist {
+            shape = "fist "
+        } else if hand.isPinchPose {
+            shape = "pinch"
+        } else if hand.isBeak {
+            shape = "beak "
+        } else {
+            shape = "     "
+        }
         let spread = hand.tipSpread.map { String(format: "%.2f", $0) } ?? " -- "
         let pinch = hand.pinchDistance.map { String(format: "%.2f", $0) } ?? " -- "
         let palm = hand.palmCenter.map { String(format: "(%.2f,%.2f)", $0.x, $0.y) } ?? "(--,--)"
-        let length = hand.indexLength.map { String(format: "%.3f", $0) } ?? " --  "
         let velocity = String(format: "(%+.2f,%+.2f)", hand.velocity.dx, hand.velocity.dy)
-        return "\(hand.chirality.rawValue) \(fingers) \(fist) pinch=\(pinch) spread=\(spread) palm=\(palm) len=\(length) v=\(velocity)"
+        var line = "\(hand.chirality.rawValue) \(fingers) \(hand.fingerCount) \(shape) pinch=\(pinch) spread=\(spread) palm=\(palm) v=\(velocity)"
+        if mode == .stream {
+            line += "  straight " + Finger.fourFingers.map { finger in
+                let value = hand.straightness[finger].map { String(format: "%.2f", $0) } ?? " -- "
+                return "\(finger.rawValue.prefix(1).uppercased())=\(value)"
+            }.joined(separator: " ")
+        }
+        return line
+    }
+
+    private static func letter(for finger: Finger, in hand: HandSnapshot) -> String {
+        let letter = String(finger.rawValue.prefix(1))
+        switch hand.fingerStates[finger] {
+        case .extended: return letter.uppercased()
+        case .bent: return letter
+        case .curled: return "·"
+        case nil: return "?"
+        }
     }
 
     private func jointDump(_ hand: HandSnapshot) -> String {
@@ -170,7 +196,10 @@ final class HandLogger: @unchecked Sendable {
 
             // Hysteresis: it takes a tighter pinch to start than to stay pinched.
             let threshold = state.pinching ? HandSnapshot.pinchReleaseThreshold : HandSnapshot.pinchThreshold
-            let pinching = (hand.pinchDistance ?? .infinity) < threshold
+            var pinching = false
+            if let distance = hand.pinchDistance {
+                pinching = distance < threshold
+            }
             if pinching != state.pinching {
                 state.pinching = pinching
                 events.append("\(side.rawValue) pinch \(pinching ? "start" : "end")\(location)")

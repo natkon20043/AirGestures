@@ -24,7 +24,12 @@ let package = Package(
                     "-Xlinker", infoPlist,
                 ])
             ]
-        )
+        ),
+        .testTarget(
+            name: "AirGesturesTests",
+            dependencies: ["AirGestures"],
+            path: "Tests/AirGesturesTests"
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

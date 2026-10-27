@@ -179,7 +179,7 @@ final class GestureRecognizer: @unchecked Sendable {
     }
 
     private static func posture(of hand: HandSnapshot) -> Posture {
-        if hand.pinchDistance != nil { return .pinch }
+        if hand.isPinchPose { return .pinch }
         // The thumb is ignored for swipes — Vision misses it too often.
         switch hand.extendedFingers.subtracting([.thumb]) {
         case [.index, .middle, .ring, .little]: return .fourFingers
