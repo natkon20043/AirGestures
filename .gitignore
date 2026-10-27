@@ -1,11 +1,5 @@
-# Build output
-build/
-build-*/
-
-# macOS
+.build/
+.swiftpm/
+*.xcodeproj/
+xcuserdata/
 .DS_Store
-
-# Editor / IDE folders
-.vscode/
-.idea/
-.cache/.cache/
