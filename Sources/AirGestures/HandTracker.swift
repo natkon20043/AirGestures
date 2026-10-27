@@ -17,16 +17,12 @@ final class HandTracker: @unchecked Sendable {
     let frames: AsyncStream<HandFrame>
 
     static let minJointConfidence: Float = 0.3
-    /// Smoothing for palm velocity (0 = frozen, 1 = raw per-frame value).
-    static let velocitySmoothing = 0.5
-    /// Forget a hand's motion history if it hasn't been seen for this long.
-    static let velocityResetInterval: TimeInterval = 0.3
 
     private let continuation: AsyncStream<HandFrame>.Continuation
     private let request: VNDetectHumanHandPoseRequest
     private let sequenceHandler = VNSequenceRequestHandler()
     private let swapHands: Bool
-    private var previous: [Chirality: (center: CGPoint, time: TimeInterval, velocity: CGVector)] = [:]
+    private var motion = MotionTracker()
 
     init(swapHands: Bool = false) {
         (frames, continuation) = AsyncStream.makeStream(of: HandFrame.self, bufferingPolicy: .bufferingNewest(8))
@@ -48,7 +44,7 @@ final class HandTracker: @unchecked Sendable {
         var hands: [HandSnapshot] = []
         for observation in request.results ?? [] {
             guard var hand = snapshot(from: observation, aspectRatio: aspectRatio) else { continue }
-            hand.velocity = updateVelocity(for: hand, at: timestamp)
+            motion.update(&hand, at: timestamp)
             hands.append(hand)
         }
 
@@ -92,23 +88,65 @@ final class HandTracker: @unchecked Sendable {
         }
     }
 
-    private func updateVelocity(for hand: HandSnapshot, at time: TimeInterval) -> CGVector {
-        guard let center = hand.palmCenter else { return .zero }
-        defer { previous[hand.chirality]?.center = center; previous[hand.chirality]?.time = time }
+}
 
-        guard let last = previous[hand.chirality],
-              time - last.time < Self.velocityResetInterval,
-              time > last.time else {
-            previous[hand.chirality] = (center, time, .zero)
-            return .zero
+/// Follows each hand from frame to frame and fills in its `step` and `velocity`.
+///
+/// The step is how far the joints seen in both frames moved, not how far their middle moved.
+/// The middle of whatever is visible jumps whenever Vision drops or finds a finger mid-swipe;
+/// a joint seen twice only moves when the hand does. The median of those moves is used, so one
+/// joint Vision misplaces can't drag the result.
+struct MotionTracker {
+    /// Smoothing for velocity (0 = frozen, 1 = raw per-frame value).
+    static let velocitySmoothing = 0.5
+    /// Forget a hand's motion history if it hasn't been seen for this long.
+    static let resetInterval: TimeInterval = 0.3
+    /// Fewer joints than this in common between two frames and the step isn't trusted.
+    static let minSharedJoints = 3
+
+    private var previous: [Chirality: (joints: [Joint: CGPoint], time: TimeInterval, velocity: CGVector)] = [:]
+
+    mutating func update(_ hand: inout HandSnapshot, at time: TimeInterval) {
+        let last = previous[hand.chirality]
+        var velocity = CGVector.zero
+        var step = CGVector.zero
+
+        if let last, time > last.time, time - last.time < Self.resetInterval {
+            velocity = last.velocity
+            if let measured = Self.step(from: last.joints, to: hand.joints) {
+                step = measured
+                let dt = time - last.time
+                let a = Self.velocitySmoothing
+                velocity = CGVector(dx: a * step.dx / dt + (1 - a) * last.velocity.dx,
+                                    dy: a * step.dy / dt + (1 - a) * last.velocity.dy)
+            }
         }
-        let dt = time - last.time
-        let raw = CGVector(dx: (center.x - last.center.x) / dt, dy: (center.y - last.center.y) / dt)
-        let a = Self.velocitySmoothing
-        let smoothed = CGVector(dx: a * raw.dx + (1 - a) * last.velocity.dx,
-                                dy: a * raw.dy + (1 - a) * last.velocity.dy)
-        previous[hand.chirality]?.velocity = smoothed
-        return smoothed
+
+        hand.step = step
+        hand.velocity = velocity
+        previous[hand.chirality] = (hand.joints, time, velocity)
+    }
+
+    /// Median movement of the finger joints seen in both frames, or nil if too few were.
+    static func step(from before: [Joint: CGPoint], to after: [Joint: CGPoint]) -> CGVector? {
+        var xMoves: [Double] = []
+        var yMoves: [Double] = []
+        for (joint, point) in after where joint != .wrist {
+            guard let earlier = before[joint] else { continue }
+            xMoves.append(point.x - earlier.x)
+            yMoves.append(point.y - earlier.y)
+        }
+        guard xMoves.count >= minSharedJoints else { return nil }
+        return CGVector(dx: median(xMoves), dy: median(yMoves))
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count % 2 == 1 {
+            return sorted[middle]
+        }
+        return (sorted[middle - 1] + sorted[middle]) / 2
     }
 }
 

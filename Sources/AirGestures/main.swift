@@ -11,8 +11,9 @@ Gestures:
   4 fingers swipe up/down      Mission Control / App Exposé
   2 fingers swipe left/right   Previous/next window on this desktop
   1 finger twirl               Cycle windows on this desktop
-  Thumb–index pinch            Spread/close to zoom what's under the pointer
-  Whole-hand pinch             Open hand closing to a beak shrinks the window; beak opening grows it
+  Thumb–index C pinch          Hold thumb and index in a C, then spread/close to zoom under the pointer
+  Claw, then open/close        Curl the fingers into a claw and hold still, then open the hand to
+                               grow the window or close it toward a beak to shrink it
   Open hand → fist             Close the focused window
 
 Output modes (default: live status line):

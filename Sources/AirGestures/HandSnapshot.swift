@@ -75,16 +75,32 @@ struct HandSnapshot: Sendable {
     let indexLength: Double?
     /// Index, middle, ring and little all curled. (In a pinch the index is only bent, not curled.)
     let isFist: Bool
+    /// Fingers hooked like holding a ball: none straight and at least three of the four bent, but
+    /// not curled into a fist. Holding this still is what starts a whole-hand resize.
+    let isClaw: Bool
     /// Average distance of the five fingertips from their middle, in knuckle spans; nil unless all five are seen.
     /// Small when the fingertips are bunched together, large with the hand spread open.
     let tipSpread: Double?
-    /// Palm velocity in normalized image units per second (+x right, +y up). Filled in by HandTracker.
+    /// How far the hand moved since the previous frame, in normalized image units (+x right, +y up).
+    /// Measured only from joints seen in both frames, so a finger dropping in or out of view doesn't
+    /// look like the hand moving. Filled in by MotionTracker.
+    var step: CGVector = .zero
+    /// Hand velocity in normalized image units per second (+x right, +y up): `step` over time, smoothed.
+    /// Filled in by MotionTracker.
     var velocity: CGVector = .zero
 
     var extendedFingers: Set<Finger> {
         Set(fingerStates.filter { $0.value == .extended }.keys)
     }
     var fingerCount: Int { extendedFingers.count }
+
+    /// The pinch pose with the index hooked over toward the thumb in a C. A pinch has to start in
+    /// this shape, so pointing with the thumb out (an L) isn't mistaken for one.
+    var isCPinch: Bool {
+        isPinchPose && fingerStates[.index] == .bent
+    }
+
+    var speed: Double { hypot(velocity.dx, velocity.dy) }
 
     var isPinching: Bool {
         guard let pinchDistance else { return false }
@@ -203,6 +219,11 @@ struct HandSnapshot: Sendable {
         isPinchPose = pinch != nil && othersCurled && indexFree && (thumbOut || thumbTouchingIndex)
 
         isFist = Finger.fourFingers.allSatisfy { states[$0] == .curled }
+
+        let seenStates = Finger.fourFingers.compactMap { states[$0] }
+        let bentCount = seenStates.filter { $0 == .bent }.count
+        let anyStraight = seenStates.contains(.extended)
+        isClaw = !anyStraight && bentCount >= 3
 
         let fingerPoints = joints.filter { $0.key != .wrist }.map(\.value)
         palmCenter = Self.middle(of: fingerPoints)

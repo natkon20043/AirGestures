@@ -113,8 +113,12 @@ final class HandLogger: @unchecked Sendable {
         let shape: String
         if hand.isFist {
             shape = "fist "
+        } else if hand.isCPinch {
+            shape = "C    "
         } else if hand.isPinchPose {
             shape = "pinch"
+        } else if hand.isClaw {
+            shape = "claw "
         } else if hand.isBeak {
             shape = "beak "
         } else {

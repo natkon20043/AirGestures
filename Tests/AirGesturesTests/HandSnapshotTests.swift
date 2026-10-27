@@ -3,8 +3,10 @@ import Testing
 @testable import AirGestures
 
 /// Hands drawn by hand: palm facing the camera, knuckles in a row at y = 0.40, no wrist anywhere.
-/// Each finger is four points (knuckle, middle joint, top joint, tip).
-private struct DrawnHand {
+/// Each finger is four points (knuckle, middle joint, top joint, tip). `offset` slides the whole
+/// hand across the frame, so a hand can change shape mid-move and stay where it was.
+struct DrawnHand {
+    var offset = CGVector.zero
     var joints: [Joint: CGPoint] = [
         .indexMCP: CGPoint(x: 0.44, y: 0.40),
         .middleMCP: CGPoint(x: 0.48, y: 0.40),
@@ -53,8 +55,9 @@ private struct DrawnHand {
     }
 
     var snapshot: HandSnapshot {
-        let confidence = joints.mapValues { _ in Float(0.9) }
-        return HandSnapshot(chirality: .right, confidence: 0.9, joints: joints,
+        let placed = joints.mapValues { CGPoint(x: $0.x + offset.dx, y: $0.y + offset.dy) }
+        let confidence = placed.mapValues { _ in Float(0.9) }
+        return HandSnapshot(chirality: .right, confidence: 0.9, joints: placed,
                             jointConfidence: confidence, aspectRatio: 1)
     }
 }

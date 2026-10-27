@@ -48,12 +48,17 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Frames the driving hand can go missing before we let go of it.
     static let lostFrames = 5
 
-    /// Palm travel (aspect-corrected normalized units) needed for a swipe.
+    /// Hand travel (aspect-corrected normalized units) needed for a swipe.
     static let minSwipeDistance = 0.15
-    /// Palm speed above which the hand counts as moving, and below which a moving hand counts as stopped.
+    /// Hand speed above which the hand counts as moving, and below which a moving hand counts as stopped.
+    /// While it's moving faster than `swipeMoveSpeed` the posture is left alone: motion blur makes
+    /// Vision lose fingers, and a swipe would otherwise turn into a pinch halfway through.
     static let swipeMoveSpeed = 0.4
     static let swipeStopSpeed = 0.15
     static let swipeCooldown: TimeInterval = 0.6
+    /// The swipe's longer axis has to be this many times its shorter one. A diagonal is too
+    /// ambiguous to guess, so it does nothing.
+    static let swipeDominance = 1.4
 
     /// How much index-tip history the twirl looks at.
     static let twirlWindow: TimeInterval = 1.0
@@ -75,10 +80,6 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Smoothing for the pinch line (0 = frozen, 1 = raw).
     static let pinchSmoothing = 0.4
 
-    /// An open hand counts as closing into a pinch once its fingertip spread drops below this fraction of its open size.
-    static let resizeCloseRatio = 0.75
-    /// How long after the hand was last fully open a close still counts.
-    static let resizeOpenMemory: TimeInterval = 0.5
     /// Added to both spreads before dividing, so a beak (tiny spread) doesn't make the scale explode.
     static let resizeSoftening = 1.0
     /// The resize ends once the fingertip spread hasn't changed by `resizeStillChange` for this long.
@@ -105,10 +106,10 @@ final class GestureRecognizer: @unchecked Sendable {
     private var candidateFrames = 0
 
     // Swipe
-    private var swipeStart: CGPoint?
-    private var swipeLast: CGPoint?
+    /// Every step the hand took since it last rested, added up (aspect-corrected). The sum of the
+    /// steps is the whole path's net travel, so a few noisy frames barely change it.
+    private var swipeTravel = CGVector.zero
     private var swipeMoved = false
-    private var swipeAspect = 1.0
     private var lastSwipeTime: TimeInterval = -.infinity
 
     // Twirl
@@ -131,9 +132,8 @@ final class GestureRecognizer: @unchecked Sendable {
     private var resizeLastMove: (spread: Double, time: TimeInterval) = (0, 0)
     private var lastResizeScale = 1.0
     private var lastResizeTime: TimeInterval = 0
-    private var openSpread: (value: Double, time: TimeInterval)?
-    private var beakFrames = 0
-    /// After a resize ends, the hand has to leave the beak shape before another can start.
+    private var clawFrames = 0
+    /// After a resize ends, the hand has to leave the claw shape before another can start.
     private var resizeNeedsRelease = false
 
     // Fist
@@ -167,7 +167,12 @@ final class GestureRecognizer: @unchecked Sendable {
             return gestures
         }
 
-        gestures += updatePosture(Self.posture(of: hand), at: t)
+        // A fast-moving hand is blurred and Vision drops fingers, so its shape isn't trusted:
+        // the posture only changes while the hand is fairly still and no swipe is in flight.
+        let steady = !swipeMoved && hand.speed < Self.swipeMoveSpeed
+        if steady {
+            gestures += updatePosture(Self.posture(of: hand, current: posture), at: t)
+        }
         switch posture {
         case .fourFingers, .twoFingers: gestures += trackSwipe(hand, at: t)
         case .oneFinger: gestures += trackTwirl(hand, at: t)
@@ -178,8 +183,10 @@ final class GestureRecognizer: @unchecked Sendable {
         return gestures
     }
 
-    private static func posture(of hand: HandSnapshot) -> Posture {
-        if hand.isPinchPose { return .pinch }
+    private static func posture(of hand: HandSnapshot, current: Posture) -> Posture {
+        // A pinch starts as a C. Once pinching, the index may straighten as the pinch opens up.
+        if hand.isCPinch { return .pinch }
+        if current == .pinch, hand.isPinchPose { return .pinch }
         // The thumb is ignored for swipes — Vision misses it too often.
         switch hand.extendedFingers.subtracting([.thumb]) {
         case [.index, .middle, .ring, .little]: return .fourFingers
@@ -214,8 +221,7 @@ final class GestureRecognizer: @unchecked Sendable {
         var gestures: [Gesture] = []
         if fire, let swipe = finishSwipe(at: t) { gestures.append(swipe) }
         if pinchReference != nil { gestures.append(.zoom(.ended)) }
-        swipeStart = nil
-        swipeLast = nil
+        swipeTravel = .zero
         swipeMoved = false
         tipSamples = []
         twirlAngle = 0
@@ -233,58 +239,60 @@ final class GestureRecognizer: @unchecked Sendable {
         openSince = nil
         openArmedAt = nil
         fistCount = 0
-        openSpread = nil
-        beakFrames = 0
+        clawFrames = 0
         resizeNeedsRelease = false
     }
 
     // MARK: - Swipe
 
     private func trackSwipe(_ hand: HandSnapshot, at t: TimeInterval) -> [Gesture] {
-        guard let palm = hand.palmCenter else { return [] }
-        let speed = hypot(hand.velocity.dx, hand.velocity.dy)
-        swipeLast = palm
-        swipeAspect = hand.aspectRatio
+        // Corrected for aspect ratio so left/right and up/down need the same real travel.
+        swipeTravel.dx += hand.step.dx * hand.aspectRatio
+        swipeTravel.dy += hand.step.dy
 
         if !swipeMoved {
-            // Keep the start pinned to where the hand was resting right before it took off.
-            if speed > Self.swipeMoveSpeed {
+            if hand.speed > Self.swipeMoveSpeed {
+                // Took off. The travel already includes the frames it spent speeding up.
                 swipeMoved = true
-                if swipeStart == nil { swipeStart = palm }
-            } else {
-                swipeStart = palm
+            } else if hand.speed < Self.swipeStopSpeed {
+                swipeTravel = .zero  // resting: the next swipe starts from here
             }
             return []
         }
-        guard speed < Self.swipeStopSpeed else { return [] }
+        guard hand.speed < Self.swipeStopSpeed else { return [] }
 
-        // Hand came to rest without changing posture: that's the end of this swipe; the next starts here.
+        // Hand came to rest: that's the end of this swipe, and the next starts here.
         let swipe = finishSwipe(at: t)
-        swipeStart = palm
+        swipeTravel = .zero
         swipeMoved = false
         return swipe.map { [$0] } ?? []
     }
 
     private func finishSwipe(at t: TimeInterval) -> Gesture? {
-        guard swipeMoved, let start = swipeStart, let end = swipeLast,
-              t - lastSwipeTime >= Self.swipeCooldown else { return nil }
+        guard swipeMoved, t - lastSwipeTime >= Self.swipeCooldown else { return nil }
         let fingers: Int
         switch posture {
         case .fourFingers: fingers = 4
         case .twoFingers: fingers = 2
         default: return nil
         }
-        // Corrected for aspect ratio so left/right and up/down need the same real travel.
-        let dx = (end.x - start.x) * swipeAspect
-        let dy = end.y - start.y
-        guard max(abs(dx), abs(dy)) >= Self.minSwipeDistance else { return nil }
+        let sideways = abs(swipeTravel.dx)
+        let upDown = abs(swipeTravel.dy)
+        let longer = max(sideways, upDown)
+        let shorter = min(sideways, upDown)
+        guard longer >= Self.minSwipeDistance else { return nil }
+        guard longer >= shorter * Self.swipeDominance else { return nil }
+
+        let direction: SwipeDirection
+        if sideways > upDown {
+            direction = swipeTravel.dx > 0 ? .right : .left
+        } else {
+            direction = swipeTravel.dy > 0 ? .up : .down
+        }
         // Two-finger swipes only go left/right.
-        if fingers == 2, abs(dy) > abs(dx) { return nil }
+        if fingers == 2, direction == .up || direction == .down { return nil }
 
         lastSwipeTime = t
-        let direction: SwipeDirection = abs(dx) >= abs(dy)
-            ? (dx > 0 ? .right : .left)
-            : (dy > 0 ? .up : .down)
         return .swipe(fingers: fingers, direction: direction)
     }
 
@@ -363,8 +371,9 @@ final class GestureRecognizer: @unchecked Sendable {
 
     // MARK: - Whole-hand resize
 
-    /// Works like a trackpad pinch with the whole hand: an open hand closing toward a beak shrinks,
-    /// a beak opening up grows. Ends when the hand holds still, curls into a fist, or leaves.
+    /// Works like a trackpad pinch with the whole hand, once a claw has started it: opening the hand
+    /// grows the window, closing it toward a beak shrinks it. Ends when the hand holds still, curls
+    /// into a fist, or leaves.
     private func trackResize(_ hand: HandSnapshot, at t: TimeInterval) -> [Gesture] {
         guard let reference = resizeReference else { return startResize(hand, at: t) }
 
@@ -390,39 +399,23 @@ final class GestureRecognizer: @unchecked Sendable {
         return [.resize(.changed(scale: scale))]
     }
 
+    /// A resize only starts on purpose: the fingers curled into a claw and held still for a few frames.
     private func startResize(_ hand: HandSnapshot, at t: TimeInterval) -> [Gesture] {
-        guard let spread = hand.tipSpread, !hand.isFist else {
-            beakFrames = 0
-            if !hand.isBeak { resizeNeedsRelease = false }
-            return []
-        }
-
-        // Remember how spread the hand was the last time it was fully open.
-        if hand.fingerCount == 5 {
-            let recent = openSpread.map { t - $0.time <= Self.resizeOpenMemory } ?? false
-            openSpread = (recent ? max(openSpread!.value, spread) : spread, t)
-        }
-
-        if hand.isBeak {
-            beakFrames += 1
-        } else {
-            beakFrames = 0
+        guard hand.isClaw else {
+            clawFrames = 0
             resizeNeedsRelease = false
-        }
-        guard !resizeNeedsRelease else { return [] }
-
-        let reference: Double
-        if let open = openSpread, t - open.time <= Self.resizeOpenMemory,
-           spread < open.value * Self.resizeCloseRatio {
-            reference = open.value  // open hand closing: shrink
-        } else if beakFrames >= Self.postureFrames {
-            reference = spread  // beak opening: grow
-        } else {
             return []
         }
+        let steady = !swipeMoved && hand.speed < Self.swipeMoveSpeed
+        guard steady, !resizeNeedsRelease, let spread = hand.tipSpread else {
+            clawFrames = 0
+            return []
+        }
+        clawFrames += 1
+        guard clawFrames >= Self.postureFrames else { return [] }
 
         var gestures = endPosture(at: t, fire: false)
-        resizeReference = reference
+        resizeReference = spread
         resizeMissing = 0
         resizeLastMove = (spread, t)
         lastResizeScale = 1
@@ -435,8 +428,7 @@ final class GestureRecognizer: @unchecked Sendable {
     private func endResize() -> [Gesture] {
         guard resizeReference != nil else { return [] }
         resizeReference = nil
-        openSpread = nil
-        beakFrames = 0
+        clawFrames = 0
         resizeNeedsRelease = true
         return [.resize(.ended)]
     }
