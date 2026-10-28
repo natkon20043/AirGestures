@@ -246,8 +246,9 @@ struct HandSnapshot: Sendable {
     private static func middle(of points: [CGPoint]) -> CGPoint? {
         guard !points.isEmpty else { return nil }
         let count = CGFloat(points.count)
-        let x = points.map(\.x).reduce(0, +) / count
-        let y = points.map(\.y).reduce(0, +) / count
+        
+        let x = points.reduce(0.0) {$0 + $1.x} / count
+        let y = points.reduce(0.0) {$0 + $1.y} / count
         return CGPoint(x: x, y: y)
     }
 }
